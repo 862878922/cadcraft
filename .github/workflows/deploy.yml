@@ -24,23 +24,31 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Install Trunk and Wasm-opt
+      - name: Install Trunk
         uses: taiki-e/install-action@v2
         with:
-          tool: trunk,wasm-opt
+          tool: trunk
 
-      - name: Build Web Application
+      - name: Install Binaryen (wasm-opt)
+        run: |
+          sudo apt-get update && sudo apt-get install -y binaryen
+          wasm-opt --version
+
+      - name: Build and Optimize Web Application
+        env:
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: "s"
+          CARGO_PROFILE_RELEASE_STRIP: "true"
         run: |
           cd apps/cadcraft-web
           trunk build --release
           cd ../..
-          echo "=== 压缩前文件大小 ==="
-          ls -lh dist/web/*.wasm
-          echo "=== 正在压缩 Wasm 文件至 25MB 限制以内 ==="
+          echo "=== 正在执行深度体积压缩 ==="
           WASM_FILE=$(ls dist/web/*_bg.wasm)
-          wasm-opt -Oz "$WASM_FILE" -o "$WASM_FILE"
-          echo "=== 压缩后文件大小 ==="
-          ls -lh dist/web/*.wasm
+          echo "压缩前大小:"
+          ls -lh "$WASM_FILE"
+          wasm-opt -Oz --strip-debug --strip-producers "$WASM_FILE" -o "$WASM_FILE"
+          echo "压缩后大小:"
+          ls -lh "$WASM_FILE"
 
       - name: Deploy to Cloudflare Pages
         env:
@@ -53,17 +61,9 @@ jobs:
           DETECTED_ID=$(echo "$ACCOUNTS_JSON" | jq -r '.result[0].id // empty')
           
           if [ -n "$DETECTED_ID" ] && [ "$DETECTED_ID" != "null" ]; then
-            echo "✅ 自动匹配到 Cloudflare 账户 ID: $DETECTED_ID"
             export CLOUDFLARE_ACCOUNT_ID="$DETECTED_ID"
           fi
 
-          # 2. 如果项目不存在，自动调用 API 创建项目兜底
-          echo "=== 确保 Pages 项目存在 ==="
-          curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects" \
-            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d '{"name":"lotelf-cad","production_branch":"main"}' || true
-
-          # 3. 安装 Wrangler 并部署
+          # 2. 安装 Wrangler 并部署
           npm install -g wrangler
           wrangler pages deploy dist/web --project-name=lotelf-cad --branch=main --commit-dirty=true
