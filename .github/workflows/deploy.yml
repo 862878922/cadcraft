@@ -35,6 +35,27 @@ jobs:
           sudo cp binaryen-version_122/bin/* /usr/local/bin/
           wasm-opt --version
 
+      - name: Optimize Cargo Profile for Minimal Size
+        run: |
+          python3 - <<'EOF'
+          import re
+          with open("Cargo.toml", "r") as f:
+              content = f.read()
+          new_profile = """[profile.release]
+          opt-level = "z"
+          lto = true
+          codegen-units = 1
+          panic = "abort"
+          strip = true
+          debug = 0
+
+          """
+          content = re.sub(r'\[profile\.release\][^\[]+', new_profile, content)
+          with open("Cargo.toml", "w") as f:
+              f.write(content)
+          print("✅ 已成功将 Cargo.toml 配置修改为极致体积优化模式！")
+          EOF
+
       - name: Build and Compress Web Application
         run: |
           cd apps/cadcraft-web
@@ -42,13 +63,13 @@ jobs:
           cd ../..
           echo "=== 检查打包产物 ==="
           WASM_FILE=$(ls dist/web/*_bg.wasm)
-          echo "压缩前大小:"
+          echo "源文件大小:"
           ls -lh "$WASM_FILE"
           
-          # 使用官方最新版 wasm-opt 进一步深度压缩
+          # 进一步用 wasm-opt 去除无用数据
           wasm-opt -Oz --strip-debug --strip-producers "$WASM_FILE" -o "$WASM_FILE" || true
           
-          echo "压缩后大小:"
+          echo "最终瘦身大小:"
           ls -lh "$WASM_FILE"
 
       - name: Deploy to Cloudflare Pages
