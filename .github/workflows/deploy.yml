@@ -37,7 +37,7 @@ jobs:
 
       - name: Optimize Profile and Disable Trunk Internal wasm-opt
         run: |
-          # 1. 禁用 Trunk 内部自带的过时 wasm-opt（避免内部老工具崩溃）
+          # 1. 禁用 Trunk 内部自带的过时 wasm-opt
           sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' apps/cadcraft-web/index.html
 
           # 2. 修改 Cargo.toml 启用极致体积压缩模式
@@ -60,6 +60,112 @@ jobs:
           print("✅ Cargo.toml 已更新为体积最小化模式")
           EOF
 
+      - name: Prepare Chinese Font and Set Default Language to Chinese
+        run: |
+          # 1. 安装字体处理工具与开源中文字体
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-wqy-microhei python3-fonttools
+
+          # 2. 生成紧凑的中文字体子集 (约 1.5MB，确保整体 WASM 远低于 25MB 限制)
+          python3 - <<'EOF'
+          from fontTools import ttLib, subset
+          import os
+
+          chars = set()
+          zh_tsv = "crates/ui-egui/src/i18n/zh.tsv"
+          if os.path.exists(zh_tsv):
+              with open(zh_tsv, "r", encoding="utf-8") as f:
+                  chars.update(f.read())
+
+          for i in range(32, 127):
+              chars.add(chr(i))
+
+          for ch in "°±⌀²³×÷≈≠≤≥αβπΩ，。！？：；“”‘’（）【】《》、—…":
+              chars.add(ch)
+
+          for code in range(0x4e00, 0x5a00):
+              chars.add(chr(code))
+
+          font_path = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
+          opt = subset.Options()
+          font = ttLib.TTFont(font_path, fontNumber=0)
+          sub = subset.Subsetter(opt)
+          sub.populate(text="".join(chars))
+          sub.subset(font)
+
+          out_dir = "crates/fonts"
+          os.makedirs(out_dir, exist_ok=True)
+          out_font = os.path.join(out_dir, "cjk_font.ttf")
+          subset.save_font(font, out_font, opt)
+          print(f"✅ 生成中文字体子集成功: {out_font}, 大小: {os.path.getsize(out_font)} 字节")
+          EOF
+
+          # 3. 配置 crates/fonts/build.rs 自动内嵌该中文字体
+          python3 - <<'EOF'
+          build_rs = "crates/fonts/build.rs"
+          with open(build_rs, "r", encoding="utf-8") as f:
+              content = f.read().replace('\r\n', '\n')
+
+          code = '''fn main() {
+              let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or_default()).join("craft_fonts.rs");
+              let font_embed = r#"pub static CRAFT_FONTS: &[CraftFont] = &[
+                  CraftFont {
+                      family: "WenQuanYi Micro Hei",
+                      style: "Regular",
+                      scripts: &["Hans"],
+                      bytes: include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/cjk_font.ttf")),
+                  },
+              ];
+          "#;
+              if let Err(e) = std::fs::write(&out, font_embed) {
+                  println!("cargo::error=writing {}: {e}", out.display());
+              }
+              return;
+          '''
+          content = content.replace('fn main() {', code, 1)
+          with open(build_rs, "w", encoding="utf-8") as f:
+              f.write(content)
+          print("✅ build.rs 已配置为内嵌中文字体")
+          EOF
+
+          # 4. 放行中文显示检测 (crates/ui-egui/src/theme.rs)
+          python3 - <<'EOF'
+          theme_rs = "crates/ui-egui/src/theme.rs"
+          with open(theme_rs, "r", encoding="utf-8") as f:
+              content = f.read().replace('\r\n', '\n')
+          target = 'l if l.starts_with("zh") => cjk_font().is_some() || embedded_script("Hans") || embedded_script("Hant"),'
+          content = content.replace(target, 'l if l.starts_with("zh") => true,')
+          with open(theme_rs, "w", encoding="utf-8") as f:
+              f.write(content)
+          print("✅ theme.rs 中文显示检测已放行")
+          EOF
+
+          # 5. 修改默认语言为中文 (crates/ui-egui/src/i18n.rs)
+          python3 - <<'EOF'
+          i18n_rs = "crates/ui-egui/src/i18n.rs"
+          with open(i18n_rs, "r", encoding="utf-8") as f:
+              content = f.read().replace('\r\n', '\n')
+          content = content.replace('#[default]\n    #[serde(rename = "auto")]\n    Auto,', '#[serde(rename = "auto")]\n    Auto,')
+          content = content.replace('#[serde(rename = "zh")]\n    Chinese,', '#[default]\n    #[serde(rename = "zh")]\n    Chinese,')
+          content = content.replace('.unwrap_or("en")', '.unwrap_or("zh")')
+          with open(i18n_rs, "w", encoding="utf-8") as f:
+              f.write(content)
+          print("✅ i18n.rs 默认语言已设为中文")
+          EOF
+
+          # 6. 设置 Web 应用初始化界面语言为中文 (apps/cadcraft-web/src/main.rs)
+          python3 - <<'EOF'
+          main_rs = "apps/cadcraft-web/src/main.rs"
+          with open(main_rs, "r", encoding="utf-8") as f:
+              content = f.read().replace('\r\n', '\n')
+          target = 'let mut app = CadApp::new(session, services()).with_control(control);'
+          replacement = target + '\n                        app.ui.interface_language = cadcraft_ui_egui::i18n::Preference::Chinese;'
+          content = content.replace(target, replacement, 1)
+          with open(main_rs, "w", encoding="utf-8") as f:
+              f.write(content)
+          print("✅ main.rs 界面语言已默认初始化为中文")
+          EOF
+
       - name: Build and Compress Web Application
         run: |
           cd apps/cadcraft-web
@@ -70,7 +176,7 @@ jobs:
           echo "Trunk 生成的文件大小:"
           ls -lh "$WASM_FILE"
           
-          # 由外部最新的 wasm-opt v122 安全执行最终瘦身
+          # 最终瘦身
           wasm-opt --all-features -Oz --strip-debug --strip-producers "$WASM_FILE" -o "$WASM_FILE" || true
           
           echo "最终瘦身大小:"
