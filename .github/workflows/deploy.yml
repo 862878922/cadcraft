@@ -33,15 +33,21 @@ jobs:
         run: |
           cd apps/cadcraft-web
           trunk build --release
-          echo "=== 检查打包产物 ==="
-          ls -la ../../dist/web
+          cd ../..
+          echo "=== 压缩前文件大小 ==="
+          ls -lh dist/web/*.wasm
+          echo "=== 正在压缩 Wasm 文件至 25MB 限制以内 ==="
+          WASM_FILE=$(ls dist/web/*_bg.wasm)
+          wasm-opt -Oz "$WASM_FILE" -o "$WASM_FILE"
+          echo "=== 压缩后文件大小 ==="
+          ls -lh dist/web/*.wasm
 
       - name: Deploy to Cloudflare Pages
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          # 1. 自动从 Token 中识别真正的 Account ID（避免填错）
+          # 1. 自动从 Token 探测真实 Account ID
           ACCOUNTS_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts" \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
           DETECTED_ID=$(echo "$ACCOUNTS_JSON" | jq -r '.result[0].id // empty')
@@ -51,6 +57,13 @@ jobs:
             export CLOUDFLARE_ACCOUNT_ID="$DETECTED_ID"
           fi
 
-          # 2. 全局安装官方最新版 Wrangler 并一键发布
+          # 2. 如果项目不存在，自动调用 API 创建项目兜底
+          echo "=== 确保 Pages 项目存在 ==="
+          curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"name":"lotelf-cad","production_branch":"main"}' || true
+
+          # 3. 安装 Wrangler 并部署
           npm install -g wrangler
           wrangler pages deploy dist/web --project-name=lotelf-cad --branch=main --commit-dirty=true
