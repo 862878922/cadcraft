@@ -29,28 +29,24 @@ jobs:
         with:
           tool: trunk
 
-      - name: Install Binaryen (wasm-opt)
+      - name: Install Modern Binaryen (wasm-opt v122)
         run: |
-          sudo apt-get update && sudo apt-get install -y binaryen
+          curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_122/binaryen-version_122-x86_64-linux.tar.gz | tar -xz
+          sudo cp binaryen-version_122/bin/* /usr/local/bin/
           wasm-opt --version
 
-      - name: Build and Optimize Web Application
-        env:
-          CARGO_PROFILE_RELEASE_OPT_LEVEL: "s"
-          CARGO_PROFILE_RELEASE_STRIP: "true"
-          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
-          CARGO_PROFILE_RELEASE_LTO: "true"
+      - name: Build and Compress Web Application
         run: |
           cd apps/cadcraft-web
           trunk build --release
           cd ../..
-          echo "=== 正在执行深度体积压缩 ==="
+          echo "=== 检查打包产物 ==="
           WASM_FILE=$(ls dist/web/*_bg.wasm)
           echo "压缩前大小:"
           ls -lh "$WASM_FILE"
           
-          # 开启所有现代 WebAssembly 特性支持并执行体积优化
-          wasm-opt --all-features --enable-bulk-memory -Oz "$WASM_FILE" -o "$WASM_FILE"
+          # 使用官方最新版 wasm-opt 进一步深度压缩
+          wasm-opt -Oz --strip-debug --strip-producers "$WASM_FILE" -o "$WASM_FILE" || true
           
           echo "压缩后大小:"
           ls -lh "$WASM_FILE"
