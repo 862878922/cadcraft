@@ -38,6 +38,8 @@ jobs:
         env:
           CARGO_PROFILE_RELEASE_OPT_LEVEL: "s"
           CARGO_PROFILE_RELEASE_STRIP: "true"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+          CARGO_PROFILE_RELEASE_LTO: "true"
         run: |
           cd apps/cadcraft-web
           trunk build --release
@@ -46,7 +48,10 @@ jobs:
           WASM_FILE=$(ls dist/web/*_bg.wasm)
           echo "压缩前大小:"
           ls -lh "$WASM_FILE"
-          wasm-opt -Oz --strip-debug --strip-producers "$WASM_FILE" -o "$WASM_FILE"
+          
+          # 开启所有现代 WebAssembly 特性支持并执行体积优化
+          wasm-opt --all-features --enable-bulk-memory -Oz "$WASM_FILE" -o "$WASM_FILE"
+          
           echo "压缩后大小:"
           ls -lh "$WASM_FILE"
 
@@ -64,6 +69,6 @@ jobs:
             export CLOUDFLARE_ACCOUNT_ID="$DETECTED_ID"
           fi
 
-          # 2. 安装 Wrangler 并部署
+          # 2. 安装 Wrangler 并发布
           npm install -g wrangler
           wrangler pages deploy dist/web --project-name=lotelf-cad --branch=main --commit-dirty=true
