@@ -33,17 +33,24 @@ jobs:
         run: |
           cd apps/cadcraft-web
           trunk build --release
-
-      - name: Test Cloudflare Credentials
-        run: |
-          echo "=== 正在测试 Token 是否有效 ==="
-          curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
-            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}"
-          echo ""
+          echo "=== 检查打包产物 ==="
+          ls -la ../../dist/web
 
       - name: Deploy to Cloudflare Pages
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy dist/web --project-name=lotelf-cad --branch=main
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          # 1. 自动从 Token 中识别真正的 Account ID（避免填错）
+          ACCOUNTS_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          DETECTED_ID=$(echo "$ACCOUNTS_JSON" | jq -r '.result[0].id // empty')
+          
+          if [ -n "$DETECTED_ID" ] && [ "$DETECTED_ID" != "null" ]; then
+            echo "✅ 自动匹配到 Cloudflare 账户 ID: $DETECTED_ID"
+            export CLOUDFLARE_ACCOUNT_ID="$DETECTED_ID"
+          fi
+
+          # 2. 全局安装官方最新版 Wrangler 并一键发布
+          npm install -g wrangler
+          wrangler pages deploy dist/web --project-name=lotelf-cad --branch=main --commit-dirty=true
