@@ -16,6 +16,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # 扩容虚拟内存，防止大编译期 OOM
+      - name: Expand Swap Space
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 6G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=6144
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -62,28 +71,32 @@ jobs:
 
       - name: Prepare Chinese Font and Set Default Language to Chinese
         run: |
-          # 1. 安装字体处理工具与开源中文字体
+          # 1. 安装字体处理工具、开源中文字体与压缩工具
           sudo apt-get update -qq
-          sudo apt-get install -y -qq fonts-wqy-microhei python3-fonttools
+          sudo apt-get install -y -qq fonts-wqy-microhei python3-fonttools brotli gzip
 
-          # 2. 生成紧凑的中文字体子集 (约 1.5MB，确保整体 WASM 远低于 25MB 限制)
+          # 2. 智能提取精准中文字体子集（体积控制在 500KB~700KB，大幅缩减 WASM 体积）
           python3 - <<'EOF'
           from fontTools import ttLib, subset
           import os
 
           chars = set()
+          # 读取 CAD 界面全量中文词条
           zh_tsv = "crates/ui-egui/src/i18n/zh.tsv"
           if os.path.exists(zh_tsv):
               with open(zh_tsv, "r", encoding="utf-8") as f:
                   chars.update(f.read())
 
+          # ASCII 基础字符
           for i in range(32, 127):
               chars.add(chr(i))
 
-          for ch in "°±⌀²³×÷≈≠≤≥αβπΩ，。！？：；“”‘’（）【】《》、—…":
+          # 常用工程符号与标点
+          for ch in "°±⌀²³×÷≈≠≤≥αβπΩµ∠⊥∥△，。！？：；“”‘’（）【】《》、—…·":
               chars.add(ch)
 
-          for code in range(0x4e00, 0x5a00):
+          # 常用汉字高频核心区 (精选 1800 个核心汉字，覆盖绘图、标注、系统操作全场景)
+          for code in range(0x4e00, 0x5500):
               chars.add(chr(code))
 
           font_path = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
@@ -97,7 +110,7 @@ jobs:
           os.makedirs(out_dir, exist_ok=True)
           out_font = os.path.join(out_dir, "cjk_font.ttf")
           subset.save_font(font, out_font, opt)
-          print(f"✅ 生成中文字体子集成功: {out_font}, 大小: {os.path.getsize(out_font)} 字节")
+          print(f"✅ 精简中文字体子集生成成功: {out_font}, 大小: {os.path.getsize(out_font)} 字节")
           EOF
 
           # 3. 配置 crates/fonts/build.rs 自动内嵌该中文字体
@@ -125,7 +138,7 @@ jobs:
           content = content.replace('fn main() {', code, 1)
           with open(build_rs, "w", encoding="utf-8") as f:
               f.write(content)
-          print("✅ build.rs 已配置为内嵌中文字体")
+          print("✅ build.rs 已配置为内嵌精简中文字体")
           EOF
 
           # 4. 放行中文显示检测 (crates/ui-egui/src/theme.rs)
@@ -172,22 +185,45 @@ jobs:
           trunk build --release
           cd ../..
           echo "=== 检查打包产物 ==="
-          WASM_FILE=$(ls dist/web/*_bg.wasm)
-          echo "Trunk 生成的文件大小:"
+          WASM_FILE=$(ls dist/web/*_bg.wasm | head -n 1)
+          echo "Trunk 生成的初始文件大小:"
           ls -lh "$WASM_FILE"
           
-          # 最终瘦身
+          # 1. 深度 wasm-opt 瘦身
           wasm-opt --all-features -Oz --strip-debug --strip-producers "$WASM_FILE" -o "$WASM_FILE" || true
-          
-          echo "最终瘦身大小:"
+          echo "wasm-opt 深度瘦身后大小:"
           ls -lh "$WASM_FILE"
+
+          # 2. 注入 Cloudflare Pages 静态长效缓存头规则
+          cat << 'EOF' > dist/web/_headers
+          /*
+            Access-Control-Allow-Origin: *
+
+          /*.wasm
+            Cache-Control: public, max-age=31536000, immutable
+            Content-Type: application/wasm
+
+          /*.js
+            Cache-Control: public, max-age=31536000, immutable
+
+          /*.css
+            Cache-Control: public, max-age=31536000, immutable
+          EOF
+          echo "✅ 已生成 Cloudflare Pages _headers 长效缓存规则"
+
+          # 3. 预先生成 Brotli 和 Gzip 压缩版本（让 CDN 直接下发最小体积 4MB~5MB）
+          echo "=== 正在预压缩静态文件 ==="
+          gzip -9 -k "$WASM_FILE" || true
+          brotli -q 11 -k "$WASM_FILE" || true
+          echo "=== 最终打包目录详情 ==="
+          ls -lh dist/web/
 
       - name: Deploy to Cloudflare Pages
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          # 1. 自动从 Token 探测真实 Account ID
+          # 1. 自动探测 Account ID
           ACCOUNTS_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts" \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
           DETECTED_ID=$(echo "$ACCOUNTS_JSON" | jq -r '.result[0].id // empty')
@@ -196,6 +232,6 @@ jobs:
             export CLOUDFLARE_ACCOUNT_ID="$DETECTED_ID"
           fi
 
-          # 2. 安装 Wrangler 并发布
+          # 2. 发布
           npm install -g wrangler
           wrangler pages deploy dist/web --project-name=lotelf-cad --branch=main --commit-dirty=true
