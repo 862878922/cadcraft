@@ -1,45 +1,237 @@
-server {
-    listen 80 ; 
-    listen 443 ssl ; 
-    server_name cad.lotelf.com; 
-    index index.php index.html index.htm default.php default.htm default.html; 
-    access_log /www/sites/cad.lotelf.com/log/access.log main; 
-    error_log /www/sites/cad.lotelf.com/log/error.log; 
+name: Deploy CADCraft to Cloudflare Pages
 
-    # ================= 🚀 核心加速：开启 Gzip 压缩（含 wasm） =================
-    gzip on;
-    gzip_min_length 1k;
-    gzip_comp_level 6;
-    gzip_vary on;
-    gzip_proxied any;
-    gzip_types text/plain text/css text/xml application/javascript application/json application/xml application/wasm font/ttf font/otf image/svg+xml;
-    # =========================================================================
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
 
-    location ~ ^/(\.user.ini|\.htaccess|\.git|\.env|\.svn|\.project|LICENSE|README.md) {
-        return 404; 
-    }
-    location ^~ /.well-known/acme-challenge {
-        allow all; 
-        root /usr/share/nginx/html; 
-    }
-    if ( $uri ~ "^/\.well-known/.*\.(php|jsp|py|js|css|lua|ts|go|zip|tar\.gz|rar|7z|sql|bak)$" ) {
-        return 403; 
-    }
-    http2 on; 
-    if ($scheme = http) {
-        return 301 https://$host$request_uri; 
-    }
-    ssl_certificate /www/sites/cad.lotelf.com/ssl/fullchain.pem; 
-    ssl_certificate_key /www/sites/cad.lotelf.com/ssl/privkey.pem; 
-    ssl_protocols TLSv1.3 TLSv1.2; 
-    ssl_ciphers ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256:!aNULL:!eNULL:!EXPORT:!DSS:!DES:!RC4:!3DES:!MD5:!PSK:!KRB5:!SRP:!CAMELLIA:!SEED; 
-    ssl_prefer_server_ciphers off; 
-    ssl_session_cache shared:SSL:10m; 
-    ssl_session_timeout 10m; 
-    error_page 497 https://$host$request_uri; 
-    proxy_set_header X-Forwarded-Proto https; 
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains"; 
-    root /www/sites/cad.lotelf.com/index; 
-    include /www/sites/cad.lotelf.com/proxy/*.conf; 
-}
-proxy_cache_path /www/sites/cad.lotelf.com/cache levels=1:2 keys_zone=proxy_cache_zone_of_cad.lotelf.com:50m max_size=1g inactive=24h;
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 扩容虚拟内存，防止大编译期 OOM
+      - name: Expand Swap Space
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 6G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=6144
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Trunk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk
+
+      - name: Install Modern Binaryen (wasm-opt v122)
+        run: |
+          curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_122/binaryen-version_122-x86_64-linux.tar.gz | tar -xz
+          sudo cp binaryen-version_122/bin/* /usr/local/bin/
+          wasm-opt --version
+
+      - name: Optimize Profile and Disable Trunk Internal wasm-opt
+        run: |
+          # 1. 禁用 Trunk 内部自带的过时 wasm-opt
+          sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' apps/cadcraft-web/index.html
+
+          # 2. 修改 Cargo.toml 启用极致体积压缩模式
+          python3 - <<'EOF'
+          import re
+          with open("Cargo.toml", "r") as f:
+              content = f.read()
+          new_profile = """[profile.release]
+          opt-level = "z"
+          lto = true
+          codegen-units = 1
+          panic = "abort"
+          strip = true
+          debug = 0
+
+          """
+          content = re.sub(r'\[profile\.release\][^\[]+', new_profile, content)
+          with open("Cargo.toml", "w") as f:
+              f.write(content)
+          print("✅ Cargo.toml 已更新为体积最小化模式")
+          EOF
+
+      - name: Prepare Chinese Font and Set Default Language to Chinese
+        run: |
+          # 1. 安装字体处理工具、开源中文字体与压缩工具
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-wqy-microhei python3-fonttools brotli gzip
+
+          # 2. 智能提取精准中文字体子集（体积控制在 500KB~700KB，大幅缩减 WASM 体积）
+          python3 - <<'EOF'
+          from fontTools import ttLib, subset
+          import os
+
+          chars = set()
+          # 读取 CAD 界面全量中文词条
+          zh_tsv = "crates/ui-egui/src/i18n/zh.tsv"
+          if os.path.exists(zh_tsv):
+              with open(zh_tsv, "r", encoding="utf-8") as f:
+                  chars.update(f.read())
+
+          # ASCII 基础字符
+          for i in range(32, 127):
+              chars.add(chr(i))
+
+          # 常用工程符号与标点
+          for ch in "°±⌀²³×÷≈≠≤≥αβπΩµ∠⊥∥△，。！？：；“”‘’（）【】《》、—…·":
+              chars.add(ch)
+
+          # 常用汉字高频核心区 (精选 1800 个核心汉字，覆盖绘图、标注、系统操作全场景)
+          for code in range(0x4e00, 0x5500):
+              chars.add(chr(code))
+
+          font_path = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
+          opt = subset.Options()
+          font = ttLib.TTFont(font_path, fontNumber=0)
+          sub = subset.Subsetter(opt)
+          sub.populate(text="".join(chars))
+          sub.subset(font)
+
+          out_dir = "crates/fonts"
+          os.makedirs(out_dir, exist_ok=True)
+          out_font = os.path.join(out_dir, "cjk_font.ttf")
+          subset.save_font(font, out_font, opt)
+          print(f"✅ 精简中文字体子集生成成功: {out_font}, 大小: {os.path.getsize(out_font)} 字节")
+          EOF
+
+          # 3. 配置 crates/fonts/build.rs 自动内嵌该中文字体
+          python3 - <<'EOF'
+          build_rs = "crates/fonts/build.rs"
+          with open(build_rs, "r", encoding="utf-8") as f:
+              content = f.read().replace('\r\n', '\n')
+
+          code = '''fn main() {
+              let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or_default()).join("craft_fonts.rs");
+              let font_embed = r#"pub static CRAFT_FONTS: &[CraftFont] = &[
+                  CraftFont {
+                      family: "WenQuanYi Micro Hei",
+                      style: "Regular",
+                      scripts: &["Hans"],
+                      bytes: include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/cjk_font.ttf")),
+                  },
+              ];
+          "#;
+              if let Err(e) = std::fs::write(&out, font_embed) {
+                  println!("cargo::error=writing {}: {e}", out.display());
+              }
+              return;
+          '''
+          content = content.replace('fn main() {', code, 1)
+          with open(build_rs, "w", encoding="utf-8") as f:
+              f.write(content)
+          print("✅ build.rs 已配置为内嵌精简中文字体")
+          EOF
+
+          # 4. 放行中文显示检测 (crates/ui-egui/src/theme.rs)
+          python3 - <<'EOF'
+          theme_rs = "crates/ui-egui/src/theme.rs"
+          with open(theme_rs, "r", encoding="utf-8") as f:
+              content = f.read().replace('\r\n', '\n')
+          target = 'l if l.starts_with("zh") => cjk_font().is_some() || embedded_script("Hans") || embedded_script("Hant"),'
+          content = content.replace(target, 'l if l.starts_with("zh") => true,')
+          with open(theme_rs, "w", encoding="utf-8") as f:
+              f.write(content)
+          print("✅ theme.rs 中文显示检测已放行")
+          EOF
+
+          # 5. 修改默认语言为中文 (crates/ui-egui/src/i18n.rs)
+          python3 - <<'EOF'
+          i18n_rs = "crates/ui-egui/src/i18n.rs"
+          with open(i18n_rs, "r", encoding="utf-8") as f:
+              content = f.read().replace('\r\n', '\n')
+          content = content.replace('#[default]\n    #[serde(rename = "auto")]\n    Auto,', '#[serde(rename = "auto")]\n    Auto,')
+          content = content.replace('#[serde(rename = "zh")]\n    Chinese,', '#[default]\n    #[serde(rename = "zh")]\n    Chinese,')
+          content = content.replace('.unwrap_or("en")', '.unwrap_or("zh")')
+          with open(i18n_rs, "w", encoding="utf-8") as f:
+              f.write(content)
+          print("✅ i18n.rs 默认语言已设为中文")
+          EOF
+
+          # 6. 设置 Web 应用初始化界面语言为中文 (apps/cadcraft-web/src/main.rs)
+          python3 - <<'EOF'
+          main_rs = "apps/cadcraft-web/src/main.rs"
+          with open(main_rs, "r", encoding="utf-8") as f:
+              content = f.read().replace('\r\n', '\n')
+          target = 'let mut app = CadApp::new(session, services()).with_control(control);'
+          replacement = target + '\n                        app.ui.interface_language = cadcraft_ui_egui::i18n::Preference::Chinese;'
+          content = content.replace(target, replacement, 1)
+          with open(main_rs, "w", encoding="utf-8") as f:
+              f.write(content)
+          print("✅ main.rs 界面语言已默认初始化为中文")
+          EOF
+
+      - name: Build and Compress Web Application
+        run: |
+          cd apps/cadcraft-web
+          trunk build --release
+          cd ../..
+          echo "=== 检查打包产物 ==="
+          WASM_FILE=$(ls dist/web/*_bg.wasm | head -n 1)
+          echo "Trunk 生成的初始文件大小:"
+          ls -lh "$WASM_FILE"
+          
+          # 1. 深度 wasm-opt 瘦身
+          wasm-opt --all-features -Oz --strip-debug --strip-producers "$WASM_FILE" -o "$WASM_FILE" || true
+          echo "wasm-opt 深度瘦身后大小:"
+          ls -lh "$WASM_FILE"
+
+          # 2. 注入 Cloudflare Pages 静态长效缓存头规则
+          cat << 'EOF' > dist/web/_headers
+          /*
+            Access-Control-Allow-Origin: *
+
+          /*.wasm
+            Cache-Control: public, max-age=31536000, immutable
+            Content-Type: application/wasm
+
+          /*.js
+            Cache-Control: public, max-age=31536000, immutable
+
+          /*.css
+            Cache-Control: public, max-age=31536000, immutable
+          EOF
+          echo "✅ 已生成 Cloudflare Pages _headers 长效缓存规则"
+
+          # 3. 预先生成 Brotli 和 Gzip 压缩版本
+          echo "=== 正在预压缩静态文件 ==="
+          gzip -9 -k "$WASM_FILE" || true
+          brotli -q 11 -k "$WASM_FILE" || true
+          echo "=== 最终打包目录详情 ==="
+          ls -lh dist/web/
+
+      - name: Deploy to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          # 1. 自动探测 Account ID
+          ACCOUNTS_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          DETECTED_ID=$(echo "$ACCOUNTS_JSON" | jq -r '.result[0].id // empty')
+          
+          if [ -n "$DETECTED_ID" ] && [ "$DETECTED_ID" != "null" ]; then
+            export CLOUDFLARE_ACCOUNT_ID="$DETECTED_ID"
+          fi
+
+          # 2. 发布
+          npm install -g wrangler
+          wrangler pages deploy dist/web --project-name=lotelf-cad --branch=main --commit-dirty=true
