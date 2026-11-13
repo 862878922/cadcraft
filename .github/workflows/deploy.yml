@@ -722,6 +722,7 @@ jobs:
           echo "=== 最终打包目录详情 ==="
           ls -lh dist/web/
 
+      # 发布到 Cloudflare Pages（增加 3 次自动重试机制以防 Cloudflare 官方 API 抖动）
       - name: Deploy to Cloudflare Pages
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -736,6 +737,16 @@ jobs:
             export CLOUDFLARE_ACCOUNT_ID="$DETECTED_ID"
           fi
 
-          # 2. 发布
+          # 2. 发布（自动重试 3 次，防止 Cloudflare API 临时 503 波动）
           npm install -g wrangler
-          wrangler pages deploy dist/web --project-name=lotelf-cad --branch=main --commit-dirty=true
+          for i in 1 2 3; do
+            echo "正在尝试发布到 Cloudflare Pages (第 $i 次)..."
+            if wrangler pages deploy dist/web --project-name=lotelf-cad --branch=main --commit-dirty=true; then
+              echo "✅ 发布成功！"
+              exit 0
+            else
+              echo "⚠️ 遇到 Cloudflare 官方 API 临时波动，等待 5 秒后重试..."
+              sleep 5
+            fi
+          done
+          exit 1
