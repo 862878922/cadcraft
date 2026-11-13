@@ -75,27 +75,23 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq fonts-wqy-microhei python3-fonttools brotli gzip
 
-          # 2. 智能提取精准中文字体子集（体积控制在 500KB~700KB，大幅缩减 WASM 体积）
+          # 2. 智能提取精准中文字体子集
           python3 - <<'EOF'
           from fontTools import ttLib, subset
           import os
 
           chars = set()
-          # 读取 CAD 界面全量中文词条
           zh_tsv = "crates/ui-egui/src/i18n/zh.tsv"
           if os.path.exists(zh_tsv):
               with open(zh_tsv, "r", encoding="utf-8") as f:
                   chars.update(f.read())
 
-          # ASCII 基础字符
           for i in range(32, 127):
               chars.add(chr(i))
 
-          # 常用工程符号与标点
           for ch in "°±⌀²³×÷≈≠≤≥αβπΩµ∠⊥∥△，。！？：；“”‘’（）【】《》、—…·":
               chars.add(ch)
 
-          # 常用汉字高频核心区 (精选 1800 个核心汉字，覆盖绘图、标注、系统操作全场景)
           for code in range(0x4e00, 0x5500):
               chars.add(chr(code))
 
@@ -110,7 +106,7 @@ jobs:
           os.makedirs(out_dir, exist_ok=True)
           out_font = os.path.join(out_dir, "cjk_font.ttf")
           subset.save_font(font, out_font, opt)
-          print(f"✅ 精简中文字体子集生成成功: {out_font}, 大小: {os.path.getsize(out_font)} 字节")
+          print(f"✅ 精简中文字体子集生成成功: {out_font}")
           EOF
 
           # 3. 配置 crates/fonts/build.rs 自动内嵌该中文字体
@@ -211,7 +207,515 @@ jobs:
           EOF
           echo "✅ 已生成 Cloudflare Pages _headers 长效缓存规则"
 
-          # 3. 预先生成 Brotli 和 Gzip 压缩版本
+          # 3. 注入极速欢迎工作台首屏 (App Shell) + 本地持久化缓存 + 行为捕获
+          cat << 'PYEOF' > inject_shell.py
+          import os, re
+
+          html_path = "dist/web/index.html"
+          if not os.path.exists(html_path):
+              print("❌ 未找到 dist/web/index.html")
+              exit(1)
+
+          with open(html_path, "r", encoding="utf-8") as f:
+              html = f.read()
+
+          cache_script = """<script>
+          (function() {
+            var CACHE_NAME = 'cadcraft-v1';
+            var origFetch = window.fetch;
+            window.__cadEngineReady = false;
+            window.__stashedFiles = null;
+            window.__wantsBlank = false;
+
+            window.fetch = async function() {
+              var args = Array.prototype.slice.call(arguments);
+              var raw = args[0];
+              var url = typeof raw === 'string' ? raw : (raw && (raw.href || raw.url) ? (raw.href || raw.url) : String(raw || ''));
+              if (url.indexOf('.wasm') !== -1) {
+                if ('caches' in window) {
+                  try {
+                    var cache = await caches.open(CACHE_NAME);
+                    var cached = await cache.match(raw);
+                    if (cached) {
+                      console.log('[CacheStorage] 命中本地持久缓存，免下载瞬启!');
+                      if (window.__updateCadProgress) window.__updateCadProgress(90, '本地引擎就绪，正在初始化渲染管线...');
+                      return cached;
+                    }
+                    var netResp = await origFetch.apply(this, args);
+                    if (netResp.ok) {
+                      cache.put(raw, netResp.clone());
+                    }
+                    return netResp;
+                  } catch(e) {}
+                }
+              }
+              return origFetch.apply(this, args);
+            };
+          })();
+          </script>"""
+
+          style_content = """<style>
+            #cad_welcome_shell {
+              position: absolute;
+              inset: 0;
+              z-index: 9999;
+              background: radial-gradient(circle at 50% 35%, #1e2632 0%, #10141a 100%);
+              display: flex;
+              flex-direction: column;
+              justify-content: space-between;
+              align-items: center;
+              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+              color: #e2e8f0;
+              transition: opacity 0.35s ease, visibility 0.35s ease;
+              user-select: none;
+              overflow: hidden;
+            }
+            #cad_welcome_shell.fade-out {
+              opacity: 0;
+              visibility: hidden;
+              pointer-events: none;
+            }
+            .cad-grid-bg {
+              position: absolute;
+              inset: 0;
+              background-image: linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
+                                linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
+              background-size: 30px 30px;
+              pointer-events: none;
+            }
+            .cad-top-bar {
+              width: 100%;
+              box-sizing: border-box;
+              padding: 16px 28px;
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              position: relative;
+              z-index: 2;
+            }
+            .cad-logo-group {
+              display: flex;
+              align-items: center;
+              gap: 10px;
+            }
+            .cad-logo-icon {
+              width: 32px;
+              height: 32px;
+              background: linear-gradient(135deg, #0ea5e9, #2563eb);
+              border-radius: 8px;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              font-weight: 800;
+              font-size: 18px;
+              color: #fff;
+              box-shadow: 0 4px 14px rgba(14, 165, 233, 0.4);
+            }
+            .cad-brand-name {
+              font-size: 18px;
+              font-weight: 700;
+              letter-spacing: 0.5px;
+              color: #f8fafc;
+            }
+            .cad-version-tag {
+              font-size: 11px;
+              background: rgba(255,255,255,0.08);
+              border: 1px solid rgba(255,255,255,0.12);
+              padding: 2px 8px;
+              border-radius: 12px;
+              color: #94a3b8;
+            }
+            .cad-engine-badge {
+              display: flex;
+              align-items: center;
+              gap: 8px;
+              font-size: 12px;
+              padding: 6px 14px;
+              border-radius: 20px;
+              background: rgba(15, 23, 42, 0.6);
+              border: 1px solid rgba(255,255,255,0.1);
+              color: #94a3b8;
+            }
+            .cad-status-dot {
+              width: 8px;
+              height: 8px;
+              border-radius: 50%;
+              background: #eab308;
+              box-shadow: 0 0 8px #eab308;
+              animation: cad-pulse 1.5s infinite;
+            }
+            .cad-status-dot.ready {
+              background: #10b981;
+              box-shadow: 0 0 8px #10b981;
+              animation: none;
+            }
+            @keyframes cad-pulse {
+              0%, 100% { opacity: 1; transform: scale(1); }
+              50% { opacity: 0.4; transform: scale(0.85); }
+            }
+            .cad-center-hub {
+              position: relative;
+              z-index: 2;
+              max-width: 540px;
+              width: 90%;
+              background: rgba(24, 32, 44, 0.75);
+              border: 1px solid rgba(255, 255, 255, 0.1);
+              border-radius: 16px;
+              padding: 30px 32px 24px;
+              box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255,255,255,0.1);
+              backdrop-filter: blur(16px);
+              text-align: center;
+            }
+            .cad-hub-title {
+              font-size: 23px;
+              font-weight: 700;
+              margin: 0 0 8px;
+              color: #f1f5f9;
+            }
+            .cad-hub-desc {
+              font-size: 13px;
+              color: #94a3b8;
+              margin: 0 0 22px;
+              line-height: 1.5;
+            }
+            .cad-actions {
+              display: flex;
+              flex-direction: column;
+              gap: 12px;
+            }
+            .cad-action-btn {
+              display: flex;
+              align-items: center;
+              gap: 14px;
+              padding: 13px 16px;
+              background: rgba(255, 255, 255, 0.04);
+              border: 1px solid rgba(255, 255, 255, 0.08);
+              border-radius: 10px;
+              color: #f8fafc;
+              cursor: pointer;
+              text-align: left;
+              transition: all 0.2s ease;
+              outline: none;
+            }
+            .cad-action-btn:hover {
+              background: rgba(14, 165, 233, 0.12);
+              border-color: rgba(14, 165, 233, 0.4);
+              transform: translateY(-2px);
+              box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+            }
+            .cad-action-btn:active {
+              transform: translateY(0);
+            }
+            .cad-btn-icon {
+              width: 38px;
+              height: 38px;
+              border-radius: 8px;
+              background: rgba(255,255,255,0.06);
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              font-size: 20px;
+              flex-shrink: 0;
+            }
+            .cad-action-btn:hover .cad-btn-icon {
+              background: #0ea5e9;
+            }
+            .cad-btn-texts {
+              flex: 1;
+            }
+            .cad-btn-label {
+              font-size: 15px;
+              font-weight: 600;
+              margin-bottom: 2px;
+              display: flex;
+              align-items: center;
+              gap: 6px;
+            }
+            .cad-btn-sub {
+              font-size: 12px;
+              color: #64748b;
+            }
+            .cad-action-btn:hover .cad-btn-sub {
+              color: #94a3b8;
+            }
+            .cad-progress-wrap {
+              margin-top: 22px;
+              padding-top: 16px;
+              border-top: 1px solid rgba(255,255,255,0.06);
+            }
+            .cad-progress-bar-bg {
+              width: 100%;
+              height: 5px;
+              background: rgba(255,255,255,0.08);
+              border-radius: 3px;
+              overflow: hidden;
+              margin-bottom: 8px;
+            }
+            .cad-progress-bar-fill {
+              height: 100%;
+              width: 20%;
+              background: linear-gradient(90deg, #0ea5e9, #38bdf8);
+              border-radius: 3px;
+              transition: width 0.3s ease;
+              box-shadow: 0 0 10px rgba(14, 165, 233, 0.5);
+            }
+            .cad-progress-text {
+              font-size: 12px;
+              color: #64748b;
+              display: flex;
+              justify-content: space-between;
+            }
+            .cad-footer {
+              position: relative;
+              z-index: 2;
+              font-size: 12px;
+              color: #64748b;
+              padding: 16px;
+            }
+            #cad_welcome_shell.dragover-highlight {
+              background: radial-gradient(circle at 50% 35%, #1d334a 0%, #0d1e2e 100%) !important;
+            }
+          </style>"""
+
+          shell_dom = """<div id="cad_welcome_shell">
+            <div class="cad-grid-bg"></div>
+
+            <header class="cad-top-bar">
+              <div class="cad-logo-group">
+                <div class="cad-logo-icon">📐</div>
+                <span class="cad-brand-name">CADCraft</span>
+                <span class="cad-version-tag">网页工程制图</span>
+              </div>
+              <div class="cad-engine-badge">
+                <span class="cad-status-dot" id="cad_status_dot"></span>
+                <span id="cad_status_text">渲染管线预热中...</span>
+              </div>
+            </header>
+
+            <main class="cad-center-hub">
+              <h1 class="cad-hub-title">工程绘图工作台</h1>
+              <p class="cad-hub-desc">轻量、专业、跨平台的在线 CAD 设计套件<br>支持 DWG / DXF 图纸解析、标注测量与二维编辑</p>
+
+              <div class="cad-actions">
+                <button class="cad-action-btn" id="cad_btn_open">
+                  <div class="cad-btn-icon">📂</div>
+                  <div class="cad-btn-texts">
+                    <div class="cad-btn-label" id="cad_open_label">打开本地图纸</div>
+                    <div class="cad-btn-sub">支持 .dwg, .dxf 等 CAD 文件，或直接拖拽至窗口</div>
+                  </div>
+                </button>
+
+                <button class="cad-action-btn" id="cad_btn_new">
+                  <div class="cad-btn-icon">➕</div>
+                  <div class="cad-btn-texts">
+                    <div class="cad-btn-label" id="cad_new_label">新建空白工程</div>
+                    <div class="cad-btn-sub">进入标准毫米绘图环境，即刻开始绘制</div>
+                  </div>
+                </button>
+
+                <button class="cad-action-btn" id="cad_btn_sample">
+                  <div class="cad-btn-icon">⚡</div>
+                  <div class="cad-btn-texts">
+                    <div class="cad-btn-label">浏览机械示例</div>
+                    <div class="cad-btn-sub">体验官方示例零件与平面工程图纸</div>
+                  </div>
+                </button>
+              </div>
+
+              <input type="file" id="cad_native_file_input" accept=".dwg,.dxf,.shx" multiple style="display:none">
+
+              <div class="cad-progress-wrap">
+                <div class="cad-progress-bar-bg">
+                  <div class="cad-progress-bar-fill" id="cad_progress_fill"></div>
+                </div>
+                <div class="cad-progress-text">
+                  <span id="cad_loading_stage">正在连接国内加速节点...</span>
+                  <span id="cad_loading_pct">20%</span>
+                </div>
+              </div>
+            </main>
+
+            <footer class="cad-footer">
+              💡 提示：可随时将图纸拖入窗口任意位置直接打开
+            </footer>
+          </div>"""
+
+          shell_logic = """<script>
+          (function() {
+            var shell = document.getElementById('cad_welcome_shell');
+            var progressFill = document.getElementById('cad_progress_fill');
+            var loadingStage = document.getElementById('cad_loading_stage');
+            var loadingPct = document.getElementById('cad_loading_pct');
+            var statusDot = document.getElementById('cad_status_dot');
+            var statusText = document.getElementById('cad_status_text');
+            var btnOpen = document.getElementById('cad_btn_open');
+            var btnNew = document.getElementById('cad_btn_new');
+            var btnSample = document.getElementById('cad_btn_sample');
+            var fileInput = document.getElementById('cad_native_file_input');
+            var openLabel = document.getElementById('cad_open_label');
+            var newLabel = document.getElementById('cad_new_label');
+
+            var currentProgress = 20;
+            window.__updateCadProgress = function(pct, text) {
+              if (pct > currentProgress) currentProgress = pct;
+              if (progressFill) progressFill.style.width = currentProgress + '%';
+              if (loadingPct) loadingPct.innerText = currentProgress + '%';
+              if (text && loadingStage) loadingStage.innerText = text;
+            };
+
+            var timer = setInterval(function() {
+              if (window.__cadEngineReady) {
+                clearInterval(timer);
+                return;
+              }
+              if (currentProgress < 85) {
+                currentProgress += Math.floor(Math.random() * 8) + 3;
+                if (currentProgress > 85) currentProgress = 85;
+                if (progressFill) progressFill.style.width = currentProgress + '%';
+                if (loadingPct) loadingPct.innerText = currentProgress + '%';
+                if (currentProgress > 50 && loadingStage) {
+                  loadingStage.innerText = '正在初始化 WebGPU 图形管线与中文字库...';
+                }
+              }
+            }, 350);
+
+            function enterCanvas() {
+              if (shell) {
+                shell.classList.add('fade-out');
+                setTimeout(function() {
+                  shell.style.display = 'none';
+                }, 400);
+              }
+            }
+
+            function dispatchFiles(files) {
+              var canvas = document.getElementById('cadcraft_canvas');
+              if (!canvas || !files || files.length === 0) return;
+              try {
+                var dt = new DataTransfer();
+                for (var i = 0; i < files.length; i++) {
+                  dt.items.add(files[i]);
+                }
+                var dropEvt = new DragEvent('drop', {
+                  bubbles: true,
+                  cancelable: true,
+                  dataTransfer: dt
+                });
+                canvas.dispatchEvent(dropEvt);
+              } catch(e) {
+                console.warn('Dispatch files failed:', e);
+              }
+            }
+
+            window.addEventListener('TrunkApplicationStarted', function() {
+              window.__cadEngineReady = true;
+              clearInterval(timer);
+              window.__updateCadProgress(100, '图形引擎就绪');
+              if (statusDot) statusDot.classList.add('ready');
+              if (statusText) statusText.innerText = '引擎已就绪';
+
+              if (window.__stashedFiles) {
+                dispatchFiles(window.__stashedFiles);
+                enterCanvas();
+              } else if (window.__wantsBlank) {
+                enterCanvas();
+              } else {
+                if (newLabel) newLabel.innerText = '进入绘图工作区 ➔';
+                if (btnNew) btnNew.style.borderColor = 'rgba(14, 165, 233, 0.6)';
+              }
+            });
+
+            if (btnOpen && fileInput) {
+              btnOpen.addEventListener('click', function() {
+                fileInput.click();
+              });
+              fileInput.addEventListener('change', function(e) {
+                if (e.target.files && e.target.files.length > 0) {
+                  window.__stashedFiles = e.target.files;
+                  if (openLabel) openLabel.innerText = '✅ 已载入: ' + e.target.files[0].name;
+                  if (window.__cadEngineReady) {
+                    dispatchFiles(window.__stashedFiles);
+                    enterCanvas();
+                  } else {
+                    if (loadingStage) loadingStage.innerText = '图纸已暂存，引擎启动后立即呈现...';
+                  }
+                }
+              });
+            }
+
+            if (btnNew) {
+              btnNew.addEventListener('click', function() {
+                if (window.__cadEngineReady) {
+                  enterCanvas();
+                } else {
+                  window.__wantsBlank = true;
+                  if (newLabel) newLabel.innerText = '正在进入工作区...';
+                }
+              });
+            }
+
+            if (btnSample) {
+              btnSample.addEventListener('click', function() {
+                if (location.search.indexOf('sample') !== -1) {
+                  enterCanvas();
+                } else {
+                  var base = location.pathname;
+                  location.href = base + '?sample';
+                }
+              });
+            }
+
+            window.addEventListener('dragover', function(e) {
+              e.preventDefault();
+              if (shell && !window.__cadEngineReady) shell.classList.add('dragover-highlight');
+            });
+            window.addEventListener('dragleave', function(e) {
+              if (shell) shell.classList.remove('dragover-highlight');
+            });
+            window.addEventListener('drop', function(e) {
+              e.preventDefault();
+              if (shell) shell.classList.remove('dragover-highlight');
+              if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                window.__stashedFiles = e.dataTransfer.files;
+                if (openLabel) openLabel.innerText = '✅ 已拖入: ' + e.dataTransfer.files[0].name;
+                if (window.__cadEngineReady) {
+                  dispatchFiles(window.__stashedFiles);
+                  enterCanvas();
+                } else {
+                  if (loadingStage) loadingStage.innerText = '图纸已暂存，引擎启动后立即呈现...';
+                }
+              }
+            });
+          })();
+          </script>"""
+
+          if "<head>" in html:
+              html = html.replace("<head>", "<head>\n" + cache_script + "\n" + style_content)
+          else:
+              html = cache_script + "\n" + style_content + "\n" + html
+
+          if "<body>" in html:
+              html = html.replace("<body>", "<body>\n" + shell_dom)
+          else:
+              html = html + "\n" + shell_dom
+
+          if "</body>" in html:
+              html = html.replace("</body>", shell_logic + "\n</body>")
+          else:
+              html = html + "\n" + shell_logic
+
+          html = re.sub(r'<div id="cadcraft_loading">[^<]*</div>', '', html)
+
+          with open(html_path, "w", encoding="utf-8") as f:
+              f.write(html)
+
+          print("✅ 已成功将原生工作台首屏与时间差暂存引擎注入到 dist/web/index.html")
+          PYEOF
+
+          python3 inject_shell.py
+          rm -f inject_shell.py
+
+          # 4. 预先生成 Brotli 和 Gzip 压缩版本
           echo "=== 正在预压缩静态文件 ==="
           gzip -9 -k "$WASM_FILE" || true
           brotli -q 11 -k "$WASM_FILE" || true
